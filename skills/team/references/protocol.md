@@ -14,38 +14,40 @@ Your role file holds the detail. Everyone needs the rest of this page.
 
 ## Waiting
 
-Read `DELIVERY.md` in the run directory and choose a mode supported by your actual
-session. All seats, including the driver, need a delivery plan. Configure the adapter
-explicitly and verify a round-trip probe before relying on automatic wake.
+Nothing wakes an idle session. Messages stay in the log until you read them, and the
+user, who supervises the run, resumes a session that has something to read. Which of the
+two ways below you use depends on what your session can do, not on its name.
 
-- Claude Code: background `wait` with task-completion notification, then end the turn.
-- Codex / OpenCode V2: bind the exact session, keep `watch` running in an authorized
-  persistent terminal, read once on each wake, work and acknowledge, then end the turn.
-- Other runtimes or failed adapters: a bounded wait during an active turn, or manual
-  resume. State that automatic wake is unavailable; do not loop model turns forever.
-
-For background waiting:
+**Your CLI notifies the model when a background command finishes** (Claude Code does):
+run this as a background task, and end the turn once the task is registered.
 
 ```sh
 node "<run>/team.mjs" wait --as <you> --timeout 3600 --soft-timeout
 ```
 
-For a wake or manual resume:
+Its completion starts your next turn. Work on the batch, acknowledge it, and register the
+next wait. On `state: idle`, register it again. A command detached with `nohup` or `&`
+notifies nobody, so it does not count.
+
+**Anything else** (Codex, OpenCode, a CLI you are unsure of): read once whenever your
+turn starts, and before publishing a verdict.
 
 ```sh
 node "<run>/team.mjs" wait --as <you> --timeout 0
 ```
 
-A wake carries only a fixed reminder to read the log. It is not delivery or approval.
-`watch` batches reminders and retries a bounded number of times; missing confirmation
-produces `WAKE_FAILED`. Recover by reading and acknowledging messages, or rebinding
-with `bind`. New conversations must bind their own exact session ID. Never assume
-that a successful transport command means the model is running.
+While a turn is active and you expect an answer soon, one bounded wait is fine, within
+your tool's time limit. When there is nothing to read and nothing left to do, say that
+you are waiting for the others and end the turn; the user resumes you. Do not spend
+model turns polling, and do not promise to come back by yourself.
+
+`post` tells the sender who is `not waiting`. That line is for the user: pass it on, so
+they know which session to resume.
 
 | Exit | Meaning | What to do |
 |---|---|---|
 | 0 | messages are printed with a batch id, or `state: idle` under `--soft-timeout` | work on them, and put `--seen <batch>` on your next `post` or `wait` |
-| 3 | nothing arrived in time | follow DELIVERY.md; do not busy-poll |
+| 3 | nothing arrived in time | carry on, or end the turn as above; do not busy-poll |
 | 4 | the run is closed | stop; you are free |
 
 Only `--seen` moves your cursor. A batch you did not acknowledge comes back with the same ids, which is how an interrupted or compacted session recovers: skip what you already answered. Every `post` tells you how many messages are unread.
@@ -147,7 +149,7 @@ The report is a file (`snap --item report --file report.md`) with its own revisi
 
 | Command | Purpose |
 |---|---|
-| `status` | members, contact, delivery, what is unresolved, the watcher |
+| `status` | members, contact, who has a wait running, unread counts, what is unresolved |
 | `gates [--json]` | what is approved and why anything is not |
 | `log [--since <seq>]` | the record, without confirming anything |
 | `rebuild` | regenerate the views from `events.jsonl` |

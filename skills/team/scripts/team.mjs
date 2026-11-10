@@ -19,7 +19,7 @@
 // The operations are listed by `team.mjs help`; usage() is the one place they are
 // spelled out.
 
-import { spawn, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import {
   chmodSync, closeSync, copyFileSync, cpSync, existsSync, fsyncSync, ftruncateSync,
@@ -66,9 +66,6 @@ Anywhere in a repository:
 
 In a run (call the copy in .team/<run>/team.mjs, or pass --run <dir>):
   join --role architect|tester [--runtime <cli>] [--profile a,b] [--scope "..."] [--rejoin <id>]
-       [--wake none|codex-queue|opencode] [--thread <session>] [--server <url>]
-  bind --as <id> --wake none|codex-queue|opencode [--thread <session>] [--server <url>]
-                                                                       configure delivery for any seat, including driver
   plan submit --as d --items items.json [--draft plan-draft.md] [--affects a1,t1]
   snap --as <id> --item <name> [--for <author>]                        snapshot the tree, next revision
   snap --as <id> --item report --file <md> [--correction-of <id>]      a new revision of the report
@@ -78,8 +75,6 @@ In a run (call the copy in .team/<run>/team.mjs, or pass --run <dir>):
   exec --as <id> [--item <name> --rev <n>] [--in <dir>] [--timeout <s>] -- <command>   run a check and record it
   wait --as <id> [--timeout <seconds>] [--seen <batch>] [--poll <ms>] [--soft-timeout]
                                                                        exit 0 messages, 3 timeout, 4 closed
-  watch [--poll <ms>] [--quiet <ms>] [--max-delay <ms>] [--progress <ms>] [--retry <ms>] [--attempts <n>] [--stale <ms>]
-                                                                       wake members who cannot wait cheaply
   log [--since <n>] [--tag <t>]                                        read history; confirms nothing
   gates [--json]                                                       what is approved and what is missing
   status [--as <id> --doing "..."] [--json]                            facts about delivery and contact
@@ -291,7 +286,6 @@ function reduce(events) {
   for (const e of events) {
     switch (e.type) {
       case 'START': state.start = e; break;
-      case 'BIND': Object.assign(state.members.get(e.from), { wake: e.meta.wake, bindingSeq: e.seq }); break;
       case 'JOIN': state.members.set(e.from, { id: e.from, seq: e.seq, ts: e.ts, ...e.meta }); break;
       case 'PLAN': state.plans.push(e); state.items = e.meta.items; break;
       case 'SNAP':
@@ -436,6 +430,16 @@ function memberFiles(run, member) {
 
 const readNumber = (file) => (existsSync(file) ? Number(readFileSync(file, 'utf8')) || 0 : 0);
 
+// A wait that was killed leaves its marker behind, so the marker counts only while the
+// process that wrote it is alive. A process we may not signal is still a live one.
+function waitingSince(run, member) {
+  try {
+    const { since, pid } = JSON.parse(readFileSync(memberFiles(run, member).waiting, 'utf8'));
+    try { process.kill(pid, 0); } catch (error) { if (error.code !== 'EPERM') return null; }
+    return since;
+  } catch { return null; }
+}
+
 function touchContact(run, member) {
   const { contact } = memberFiles(run, member);
   const now = new Date();
@@ -481,7 +485,7 @@ function renderChat(events) {
 function renderTeam(run, state) {
   const start = state.start;
   const rows = [...state.members.values()].map((m) => {
-    const can = [m.caps ? `snap=${m.caps.snap ? 'yes' : 'no'}` : '', m.wake ? `wake=${m.wake.type}` : ''].filter(Boolean).join(' ');
+    const can = m.caps ? `snap=${m.caps.snap ? 'yes' : 'no'}` : '';
     return `| ${m.id} | ${m.role} | ${m.runtime ?? ''} | ${[m.profile, m.scope].filter(Boolean).join(' ')} | ${clock(m.ts)} | ${can} |`;
   });
   return [
@@ -654,7 +658,6 @@ function cmdStart({ positional, flags }) {
   if (!task || !NAME.test(task)) fail('start needs a task name (letters, digits, . _ -)', EXIT.usage);
   const mode = typeof flags.mode === 'string' ? flags.mode : 'standard';
   if (!['standard', 'lite'].includes(mode)) fail(`unknown mode "${mode}"`, EXIT.usage);
-  const wake = wakeBinding(flags);
   const top = repoTop();
   if (!top) fail('start has to run inside a git repository', EXIT.usage);
   const caps = capabilities(top);
@@ -680,9 +683,7 @@ function cmdStart({ positional, flags }) {
   const beside = dirname(SELF);
   copyFileSync(SELF, join(run, 'team.mjs'));
   const references = join(beside, '..', 'references');
-  for (const [source, target] of [['protocol.md', 'PROTOCOL.md'], ['delivery.md', 'DELIVERY.md']]) {
-    if (existsSync(join(references, source))) copyFileSync(join(references, source), join(run, target));
-  }
+  if (existsSync(join(references, 'protocol.md'))) copyFileSync(join(references, 'protocol.md'), join(run, 'PROTOCOL.md'));
   for (const dir of ['roles', 'profiles']) {
     if (existsSync(join(references, dir))) cpSync(join(references, dir), join(run, dir), { recursive: true });
   }
@@ -711,14 +712,13 @@ function cmdStart({ positional, flags }) {
     }
     return tx.append({
       from: 'd', type: 'JOIN', body: 'd joined as driver.',
-      meta: { role: 'driver', runtime: typeof flags.runtime === 'string' ? flags.runtime : null, caps, wake },
+      meta: { role: 'driver', runtime: typeof flags.runtime === 'string' ? flags.runtime : null, caps },
     });
   });
 
   const script = join(run, 'team.mjs');
   console.log(`run: ${run}`);
   console.log(`you are: ${driver.from} (driver)`);
-  console.log(`delivery: read ${join(run, 'DELIVERY.md')}; configure the driver as well as reviewers`);
   if (baseline) console.log(`baseline: refs/team/${name}/baseline ${baseline.sha.slice(0, 12)}`);
   else console.log('warning: this session cannot write git refs, so there is no baseline; run doctor');
   if (dirty.out) console.log(`already modified, these belong to the user:\n${dirty.out}`);
@@ -727,7 +727,7 @@ function cmdStart({ positional, flags }) {
     console.log(`${role}:\n  You are ${/^a/.test(role) ? 'an' : 'a'} ${role} in this team. Read ${join(run, 'roles', `${role}.md`)} and follow it.`);
     console.log(`  Join with: ${shellCommand(['node', script])} join --role ${role} --runtime <your CLI>\n`);
   }
-  console.log(`If a member's row in team.md shows wake=, run this in the background in an authorized persistent terminal: ${shellCommand(['node', script])} watch`);
+  console.log('Nothing wakes an idle session. Claude Code can keep `wait` running as a background task; any other session reads its messages when the user resumes it.');
 }
 
 function cmdRuns({ flags }) {
@@ -756,7 +756,6 @@ function cmdJoin({ flags }) {
   const run = resolveRun(flags);
   const role = flags.role;
   if (!['architect', 'tester'].includes(role)) fail('--role architect|tester; the driver joins through start', EXIT.usage);
-  const wake = wakeBinding(flags);
   const top = reduce(readEvents(run)).start.meta.repo;
   const caps = capabilities(top);
   const member = withLock(run, (tx) => {
@@ -768,7 +767,6 @@ function cmdJoin({ flags }) {
       profile: knownProfiles(run, flags.profile),
       scope: typeof flags.scope === 'string' ? flags.scope : null,
       caps,
-      wake,
     };
     let id = flags.rejoin;
     if (typeof id === 'string') {
@@ -792,13 +790,7 @@ function cmdJoin({ flags }) {
   console.log(`protocol: ${join(run, 'PROTOCOL.md')}`);
   console.log(`role: ${join(run, 'roles', `${role}.md`)}`);
   if (!caps.snap) console.log('this session cannot write git refs: ask the driver for snap --for you');
-  if (member.meta.wake) {
-    console.log(`woken by: ${member.meta.wake.type}, session ${member.meta.wake.thread}`);
-    console.log(`next: read with: ${shellCommand(['node', join(run, 'team.mjs')])} wait --as ${member.from} --timeout 0`);
-    console.log('After a successful round-trip probe, end your turn between messages. Check status for wake failures.');
-  } else {
-    console.log(`next: ${shellCommand(['node', join(run, 'team.mjs')])} wait --as ${member.from}`);
-  }
+  console.log(`next: ${shellCommand(['node', join(run, 'team.mjs')])} wait --as ${member.from}`);
 }
 
 // A misspelt profile would otherwise join quietly with no priorities at all, and nobody
@@ -811,37 +803,6 @@ function knownProfiles(run, given) {
     if (!known.includes(name)) fail(`unknown profile "${name}"; available: ${known.join(', ') || 'none'}`, EXIT.usage);
   }
   return given;
-}
-
-// Binding is explicit: inherited environment variables never attach a different CLI.
-function wakeBinding(flags) {
-  const wanted = flags.wake ?? 'none';
-  if (wanted === 'none') return null;
-  if (!['codex-queue', 'opencode'].includes(wanted)) fail(`unknown --wake "${wanted}"`, EXIT.usage);
-  const thread = typeof flags.thread === 'string' ? flags.thread
-    : wanted === 'codex-queue' ? process.env.CODEX_THREAD_ID || process.env.CODEX_SESSION_ID : null;
-  if (!thread || !/^[A-Za-z0-9_-]+$/.test(thread)) fail('--wake needs --thread <session-id> (Codex can use CODEX_THREAD_ID)', EXIT.usage);
-  const server = typeof flags.server === 'string' ? flags.server : null;
-  if (server) {
-    let url;
-    try { url = new URL(server); } catch { fail('invalid --server URL', EXIT.usage); }
-    const schemes = wanted === 'opencode' ? ['http:', 'https:'] : ['ws:', 'wss:', 'unix:'];
-    if (!schemes.includes(url.protocol) || url.username || url.password || url.search || url.hash) fail('unsupported --server URL; credentials must stay in CLI configuration', EXIT.usage);
-  }
-  return { type: wanted, thread, ...(server ? { server } : {}) };
-}
-
-function cmdBind({ flags }) {
-  if (typeof flags.wake !== 'string') fail('bind needs --wake', EXIT.usage);
-  const run = resolveRun(flags);
-  const wake = wakeBinding(flags);
-  withLock(run, (tx) => {
-    const state = reduce(tx.events);
-    requireOpen(state);
-    const member = requireMember(state, flags);
-    tx.append({ from: member.id, type: 'BIND', body: `Delivery: ${wake?.type ?? 'pull'}.`, meta: { wake } });
-  });
-  console.log(`delivery: ${wake ? `${wake.type}, session ${wake.thread}` : 'pull/background wait'}`);
 }
 
 function validateItems(items, state) {
@@ -1117,10 +1078,10 @@ function cmdPost({ flags }) {
   touchContact(run, result.member.id);
   const { event } = result;
   console.log(`${result.repeated ? 'already posted' : 'posted'} #${event.seq} ${event.id}${event.meta?.late ? ' (late: this revision is no longer the one needed, it opens nothing)' : ''}${event.meta?.not_required ? ' (not required of you, it opens nothing)' : ''}`);
-  const asleep = (event.to ?? []).filter((id) => currentState(run).members.get(id)?.wake);
-  if (asleep.length && !watcherAlive(run)) {
-    console.log(`warning: ${asleep.join(', ')} ${asleep.length > 1 ? 'are' : 'is'} woken by a watcher and none is running, so nothing will reach them. Run in the background: ${shellCommand(['node', join(run, 'team.mjs')])} watch`);
-  }
+  // Nothing wakes an idle session, so the sender has to learn who will not see this
+  // until somebody resumes them. A member with a `wait` running gets it by itself.
+  const absent = (event.to ?? []).filter((id) => id !== result.member.id && !waitingSince(run, id));
+  if (absent.length && !result.repeated) console.log(`not waiting: ${absent.join(', ')} — ask the user to resume ${absent.length > 1 ? 'those sessions' : 'that session'}`);
   if (event.meta?.contradiction) console.log(`warning: this verdict cites a run with ${event.meta.contradiction}; it is recorded as a contradiction`);
   console.log(unreadLine(run, readEvents(run), result.member.id));
 }
@@ -1274,164 +1235,6 @@ function cmdExec({ flags }) {
   console.log(`read this output first; then cite it in a verdict: --held executed --evidence ${id}`);
 }
 
-function wakeFile(run, member) { return join(paths(run).state, `wake-${member}.json`); }
-
-function readWake(run, member) {
-  const file = wakeFile(run, member);
-  if (!existsSync(file)) return { state: 'idle', attempts: 0, through: 0, lastAt: 0 };
-  return JSON.parse(readFileSync(file, 'utf8'));
-}
-
-const currentState = (run) => reduce(readEvents(run));
-
-function watcherAlive(run) {
-  const age = watcherAge(run);
-  return age !== null && age < 30_000;
-}
-
-function watcherAge(run) {
-  const file = join(paths(run).state, 'watch.json');
-  return existsSync(file) ? Date.now() - statSync(file).mtimeMs : null;
-}
-
-async function sendSignal(run, member, st) {
-  const script = join(run, 'team.mjs');
-  // Enough to find everything again, since the session may have been compacted or cleared.
-  const message = `There are new messages for you in team run ${basename(run)}. You are ${member.id}, the ${member.role}: your brief is ${join(run, 'roles', `${member.role}.md`)} and the contract is ${join(run, 'PROTOCOL.md')}. Read the messages with: ${shellCommand(['node', script])} wait --as ${member.id} --timeout 0`;
-  let command, args;
-  if (member.wake.type === 'codex-queue') {
-    command = process.env.TEAM_CODEX_CMD || process.env.TEAM_WAKE_CMD || 'codex';
-    args = ['queue', '--thread', member.wake.thread, '--message', message, '--resume'];
-    if (member.wake.server) args.push('--remote', member.wake.server);
-  } else if (member.wake.type === 'opencode') {
-    command = process.env.TEAM_OPENCODE_CMD || 'opencode';
-    // V2 HTTP API: prompt admission is durable; queue avoids steering ongoing work.
-    const body = { text: message, delivery: 'queue', resume: true };
-    args = ['api', 'session.prompt', '--param', `sessionID=${member.wake.thread}`, '--data', JSON.stringify(body)];
-    if (member.wake.server) args.push('--server', member.wake.server);
-  } else {
-    st.lastResult = `unsupported adapter ${member.wake.type}`;
-    st.sendFailed = true;
-    return;
-  }
-  const res = await new Promise((resolveResult) => {
-    const child = spawn(command, args, { cwd: reduce(readEvents(run)).start.meta.repo, stdio: ['ignore', 'pipe', 'pipe'] });
-    let stdout = '', stderr = '', error = null;
-    const timer = setTimeout(() => { error = { code: 'ETIMEDOUT' }; child.kill('SIGKILL'); }, 10000);
-    child.stdout.on('data', (s) => { stdout = (stdout + s).slice(-16000); });
-    child.stderr.on('data', (s) => { stderr = (stderr + s).slice(-16000); });
-    child.on('error', (e) => { error = e; });
-    child.on('close', (status, signal) => { clearTimeout(timer); resolveResult({ status, signal, error, stdout, stderr }); });
-  });
-  const line = `${new Date().toISOString()} signal ${st.attempts} through #${st.through}: ${describeSpawn(res)} ${(res.stdout ?? '').trim()} ${(res.stderr ?? '').trim()}\n`;
-  writeFileSync(join(paths(run).state, `wake-${member.id}.log`), line, { flag: 'a' });
-  st.lastResult = `${describeSpawn(res)} ${(res.stderr ?? '').trim()}`.trim().slice(0, 500);
-  st.sendFailed = res.status !== 0;
-}
-
-// An ordinary process, so a quiet hour costs no model turns. It carries a nudge and never
-// a message: the content stays in the log, which is why a lost or repeated signal can
-// only cost time. Only entries in the log count, so a moved cursor or a regenerated view
-// cannot cause a wake-up. A successful `codex queue` does not mean the model started,
-// so success is judged by what the member does afterwards.
-async function cmdWatch({ flags }) {
-  const run = resolveRun(flags);
-  const option = (name, fallback) => (flags[name] === undefined ? fallback : Number(flags[name]));
-  const pollMs = option('poll', 1000);
-  const quietMs = option('quiet', 2000);
-  const maxDelayMs = option('max-delay', 10_000);
-  const progressMs = option('progress', 120_000);
-  const retryMs = option('retry', 15_000);
-  const maxAttempts = option('attempts', 3);
-  const staleMs = option('stale', 10_000);
-  for (const [name, value] of Object.entries({ pollMs, quietMs, maxDelayMs, progressMs, retryMs, maxAttempts, staleMs })) {
-    if (!Number.isFinite(value) || value < (name === 'quietMs' ? 0 : 1) || (name === 'maxAttempts' && !Number.isInteger(value))) fail(`invalid watch option ${name}`, EXIT.usage);
-  }
-  const beat = join(paths(run).state, 'watch.json');
-  const token = randomUUID();
-  // A heartbeat that moves is a live watcher. One that stands still is taken over once it
-  // is old enough, so restarting right after a crash starts one instead of exiting with
-  // a success while nobody watches.
-  if (existsSync(beat)) {
-    const seen = statSync(beat).mtimeMs;
-    while (existsSync(beat) && Date.now() - statSync(beat).mtimeMs < staleMs) {
-      if (statSync(beat).mtimeMs !== seen) {
-        console.log('a watcher is already running for this run');
-        return EXIT.ok;
-      }
-      sleep(Math.min(pollMs, 200));
-    }
-  }
-  writeFileSync(beat, JSON.stringify({ token, pid: process.pid }));
-  console.log(`watching ${basename(run)}`);
-  const heartbeat = setInterval(() => {
-    try { if (JSON.parse(readFileSync(beat, 'utf8')).token === token) { const now = new Date(); utimesSync(beat, now, now); } } catch {}
-  }, Math.max(20, Math.min(1000, staleMs / 3)));
-
-  try { for (;;) {
-    let holder = null;
-    try { holder = JSON.parse(readFileSync(beat, 'utf8')).token; } catch { /* treated as replaced */ }
-    if (holder !== token) { console.log('replaced by another watcher'); return EXIT.ok; }
-    const now = new Date();
-    utimesSync(beat, now, now);
-
-    const events = readEvents(run);
-    const state = reduce(events);
-    if (state.closed) {
-      rmSync(beat, { force: true });
-      console.log(`run closed: ${state.closed.meta.status}`);
-      return EXIT.ok;
-    }
-
-    for (const member of state.members.values()) {
-      if (!member.wake) continue;
-      const files = memberFiles(run, member.id);
-      const st = readWake(run, member.id);
-      const delivered = readNumber(files.cursor);
-      const contact = existsSync(files.contact) ? statSync(files.contact).mtimeMs : 0;
-      const before = JSON.stringify(st);
-      const binding = JSON.stringify([member.wake, member.bindingSeq ?? member.seq]);
-      if (st.binding !== binding) Object.assign(st, { binding, state: 'idle', attempts: 0, through: 0, lastAt: 0 });
-
-      if (st.state !== 'idle' && delivered >= st.through) {
-        Object.assign(st, { state: 'idle', attempts: 0 });
-      } else if (st.state !== 'idle' && contact > st.lastAt) {
-        // Alive and busy, which is not a failure. The clock restarts and nothing is resent.
-        Object.assign(st, { state: 'signaled', attempts: 1, lastAt: contact });
-      }
-
-      const pending = unread(run, events, member.id).filter((e) => e.seq > delivered);
-      if (pending.length && st.state !== 'wake_failed') {
-        const newest = pending[pending.length - 1];
-        const clockNow = now.getTime();
-        const settled = clockNow - new Date(newest.ts).getTime() >= quietMs
-          || clockNow - new Date(pending[0].ts).getTime() >= maxDelayMs;
-        const send = async (attempt) => {
-          Object.assign(st, { state: 'signaled', attempts: attempt, through: newest.seq, lastAt: clockNow });
-          atomicWrite(wakeFile(run, member.id), JSON.stringify(st));
-          await sendSignal(run, member, st);
-        };
-        if (st.state === 'idle') {
-          if (settled) await send(1);
-        } else if (clockNow - st.lastAt >= (st.sendFailed ? retryMs : progressMs * 2 ** (st.attempts - 1))) {
-          if (st.attempts < maxAttempts) {
-            await send(st.attempts + 1);
-          } else {
-            st.state = 'wake_failed';
-            withLock(run, (tx) => tx.append({
-              from: 'system', to: [driverId(state)], type: 'WAKE_FAILED',
-              body: `${member.id} did not respond to ${st.attempts} signals, the oldest unread is #${pending[0].seq}. Last signal: ${st.lastResult}. Nothing more will be sent until it makes contact. Ask the user to tell that session to read its messages.`,
-              meta: { member: member.id, attempts: st.attempts, through: st.through, lastResult: st.lastResult },
-            }));
-          }
-        }
-      }
-      if (JSON.stringify(st) !== before) atomicWrite(wakeFile(run, member.id), JSON.stringify(st));
-    }
-    await new Promise((done) => setTimeout(done, pollMs));
-  } } finally { clearInterval(heartbeat); }
-}
-
 function cmdLog({ flags }) {
   const run = resolveRun(flags);
   const since = Number(flags.since ?? 0);
@@ -1483,7 +1286,7 @@ function cmdStatus({ flags }) {
   const members = [...state.members.values()].map((m) => {
     const files = memberFiles(run, m.id);
     const contact = existsSync(files.contact) ? statSync(files.contact).mtimeMs : null;
-    const waiting = existsSync(files.waiting) ? JSON.parse(readFileSync(files.waiting, 'utf8')).since : null;
+    const waiting = waitingSince(run, m.id);
     return {
       id: m.id,
       role: m.role,
@@ -1494,7 +1297,6 @@ function cmdStatus({ flags }) {
       lastContactSeconds: contact === null ? null : Math.round((now - contact) / 1000),
       waitStartedAt: waiting,
       doing: existsSync(files.doing) ? readFileSync(files.doing, 'utf8') : null,
-      wake: m.wake ? { ...m.wake, ...readWake(run, m.id) } : null,
     };
   });
   const requests = [];
@@ -1516,12 +1318,7 @@ function cmdStatus({ flags }) {
     const contact = m.lastContactSeconds === null ? 'no contact yet' : `last contact ${m.lastContactSeconds}s ago`;
     const waiting = m.waitStartedAt ? `, wait started ${clock(m.waitStartedAt)}` : '';
     const doing = m.doing ? `, says: ${m.doing}` : '';
-    const wake = m.wake ? `, wake ${m.wake.state} (signals ${m.wake.attempts})` : '';
-    console.log(`  ${m.id} ${m.role} ${m.runtime ?? ''}: ${contact}${waiting}; seen #${m.seen}, delivered #${m.delivered}, unread ${m.unread}${doing}${wake}`);
-  }
-  if (members.some((m) => m.wake)) {
-    const beat = watcherAge(run);
-    console.log(`  watcher: ${beat === null ? 'not running; start it with: watch' : `${beat < 30_000 ? 'alive' : 'NOT RESPONDING, restart it with: watch'}, last beat ${Math.round(beat / 1000)}s ago`}`);
+    console.log(`  ${m.id} ${m.role} ${m.runtime ?? ''}: ${contact}${waiting}; seen #${m.seen}, delivered #${m.delivered}, unread ${m.unread}${doing}`);
   }
   for (const r of requests) console.log(`  ${r.item}@r${r.rev} -> ${r.reviewer}: ${r.state}`);
 }
@@ -1620,13 +1417,11 @@ function main(argv) {
     case 'runs': return cmdRuns(args);
     case 'doctor': return cmdDoctor(args);
     case 'join': return cmdJoin(args);
-    case 'bind': return cmdBind(args);
     case 'plan': return cmdPlan(args);
     case 'snap': return cmdSnap(args);
     case 'post': return cmdPost(args);
     case 'exec': return cmdExec(args);
     case 'wait': return cmdWait(args);
-    case 'watch': return cmdWatch(args);
     case 'log': return cmdLog(args);
     case 'gates': return cmdGates(args);
     case 'status': return cmdStatus(args);

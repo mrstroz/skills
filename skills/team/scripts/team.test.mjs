@@ -782,221 +782,26 @@ test('exec records a spawn that could not start, with every field', () => {
   assert.equal(record.meta.errorCode, 'ENOENT');
 });
 
-// A stand-in for `codex queue`: records its arguments, and acts per the mode file.
-function fakeWake(r) {
-  const dir = mkdtempSync(join(tmpdir(), 'team-wake-'));
-  roots.push(dir);
-  const calls = join(dir, 'calls.txt');
-  const script = join(dir, 'fake.sh');
-  writeFileSync(script, `#!/bin/sh\nprintf '%s\\n' "$*" >> ${JSON.stringify(calls)}\ncat ${JSON.stringify(join(dir, 'err'))} >&2 2>/dev/null\nexit $(cat ${JSON.stringify(join(dir, 'code'))} 2>/dev/null || echo 0)\n`);
-  execFileSync('chmod', ['+x', script]);
-  const count = () => (existsSync(calls) ? readFileSync(calls, 'utf8').trim().split('\n').filter(Boolean).length : 0);
-  const watch = (...args) => {
-    const child = spawn(process.execPath, [r.script, 'watch', '--poll', '40', ...args], { cwd: r.root, stdio: 'pipe', env: { ...process.env, TEAM_WAKE_CMD: script } });
-    let out = '';
-    child.stdout.on('data', (d) => { out += d; });
-    return { child, closed: new Promise((done) => child.on('close', done)), out: () => out };
-  };
-  return { dir, calls, count, watch };
-}
-
-const pause = (ms) => new Promise((done) => setTimeout(done, ms));
-
-async function until(check, ms = 8000) {
-  const end = Date.now() + ms;
-  while (Date.now() < end) {
-    if (check()) return true;
-    await pause(30);
-  }
-  return false;
-}
-
-function codexMember(r) {
-  r.ok('join', '--role', 'architect', '--runtime', 'codex', '--rejoin', 'a1', '--wake', 'codex-queue', '--thread', 'thread-a1');
+// Nothing wakes an idle session, so the sender is told who will not see a message
+// until the user resumes them. A marker left by a killed wait must not count.
+test('post names the addressees who have no wait running, and a dead wait is not one', async () => {
+  const r = makeRun();
   r.drain('a1');
-}
-
-test('explicit Codex binding uses its environment; no ambient binding for other CLIs', () => {
-  const r = makeRun();
-  const res = spawnSync(process.execPath, [r.script, 'join', '--role', 'tester', '--runtime', 'codex', '--wake', 'codex-queue'], { cwd: r.root, encoding: 'utf8', env: { ...process.env, CODEX_THREAD_ID: 'from-env' } });
-  assert.match(res.stdout, /woken by: codex-queue, session from-env/);
-  assert.match(res.stdout, /end your turn/);
-  const none = spawnSync(process.execPath, [r.script, 'join', '--role', 'tester', '--wake', 'none'], { cwd: r.root, encoding: 'utf8', env: { ...process.env, CODEX_THREAD_ID: 'from-env' } });
-  assert.doesNotMatch(none.stdout, /woken by/);
-  const missing = spawnSync(process.execPath, [r.script, 'join', '--role', 'tester', '--wake', 'codex-queue'], { cwd: r.root, env: { ...process.env, CODEX_THREAD_ID: '', CODEX_SESSION_ID: '' } });
-  assert.equal(missing.status, 2, 'needs a session id');
-});
-
-test('a rejoin from a new session moves the signal there', async () => {
-  const r = makeRun();
-  codexMember(r);
-  const w = fakeWake(r);
-  const watcher = w.watch('--quiet', '100', '--progress', '60000');
-  r.ok('post', '--as', 'd', '--to', 'a1', '--type', 'NOTE', '--body', 'first');
-  assert.ok(await until(() => w.count() === 1), 'the first signal');
-  r.ok('join', '--role', 'architect', '--runtime', 'codex', '--rejoin', 'a1', '--wake', 'codex-queue', '--thread', 'thread-new');
+  assert.match(r.ok('post', '--as', 'd', '--to', 'a1,t1', '--type', 'NOTE', '--body', 'nobody listens').out, /not waiting: a1, t1 /);
   r.drain('a1');
-  r.ok('post', '--as', 'd', '--to', 'a1', '--type', 'NOTE', '--body', 'second');
-  assert.ok(await until(() => w.count() === 2), 'the second signal');
-  watcher.child.kill();
-  await watcher.closed;
-  const [before, after] = readFileSync(w.calls, 'utf8').trim().split('\n');
-  assert.match(before, /--thread thread-a1 /);
-  assert.match(after, /--thread thread-new /);
-});
-
-test('watch: a burst gives one signal, it carries no message text, and read state causes none', async () => {
-  const r = makeRun();
-  codexMember(r);
-  const w = fakeWake(r);
-  const watcher = w.watch('--quiet', '300', '--progress', '60000');
-  await pause(200);
-  assert.equal(w.count(), 0, 'silence costs nothing');
-
-  for (let i = 0; i < 5; i++) r.ok('post', '--as', 'd', '--to', 'a1', '--type', 'NOTE', '--body', `secret body ${i}`);
-  assert.ok(await until(() => w.count() === 1), 'one signal for the burst');
-  await pause(400);
-  assert.equal(w.count(), 1);
-  const call = readFileSync(w.calls, 'utf8');
-  assert.match(call, /queue --thread thread-a1 --message/);
-  assert.match(call, /--resume/);
-  assert.doesNotMatch(call, /secret body/, 'content stays in the log');
-
-  // The member reads: the cursor, the delivery file and the views all change, and nothing is sent.
-  const batch = batchOf(r.ok('wait', '--as', 'a1', '--timeout', '0').out);
-  r.team('wait', '--as', 'a1', '--timeout', '0', '--seen', batch);
-  r.ok('rebuild');
-  await pause(400);
-  assert.equal(w.count(), 1);
-
-  // A message for somebody else does not wake it either.
-  r.ok('post', '--as', 'd', '--to', 't1', '--type', 'NOTE', '--body', 'for t1');
-  await pause(400);
-  assert.equal(w.count(), 1);
-  r.ok('post', '--as', 'd', '--to', 'a1', '--type', 'NOTE', '--body', 'next one');
-  assert.ok(await until(() => w.count() === 2), 'a new message after a read gets a new signal');
-  watcher.child.kill();
-  await watcher.closed;
-});
-
-test('watch: no response gets limited retries, then one wake_failed to the driver and silence', async () => {
-  const r = makeRun();
-  codexMember(r);
-  r.drain('d');
-  const w = fakeWake(r);
-  const watcher = w.watch('--quiet', '0', '--progress', '150', '--attempts', '3');
-  r.ok('post', '--as', 'd', '--to', 'a1', '--type', 'NOTE', '--body', 'are you reading this');
-  assert.ok(await until(() => r.events().some((e) => e.type === 'WAKE_FAILED')), 'failure becomes visible');
-  assert.equal(w.count(), 3);
-  await pause(500);
-  assert.equal(w.count(), 3, 'nothing more is sent');
-  assert.equal(r.events().filter((e) => e.type === 'WAKE_FAILED').length, 1);
-  assert.match(r.ok('wait', '--as', 'd', '--timeout', '0').out, /did not respond to 3 signals/);
-  const status = JSON.parse(r.ok('status', '--json').out).members.find((m) => m.id === 'a1');
-  assert.equal(status.wake.state, 'wake_failed');
-
-  // The user tells that session by hand; once it reads, signals work again.
-  const batch = batchOf(r.ok('wait', '--as', 'a1', '--timeout', '0').out);
-  r.team('wait', '--as', 'a1', '--timeout', '0', '--seen', batch);
-  assert.ok(await until(() => JSON.parse(r.ok('status', '--json').out).members.find((m) => m.id === 'a1').wake.state === 'idle'));
-  r.ok('post', '--as', 'd', '--to', 'a1', '--type', 'NOTE', '--body', 'after recovery');
-  assert.ok(await until(() => w.count() === 4));
-  watcher.child.kill();
-  await watcher.closed;
-});
-
-test('watch: a failing queue command retries quickly and the failure names what it said', async () => {
-  const r = makeRun();
-  codexMember(r);
-  r.drain('d');
-  const w = fakeWake(r);
-  writeFileSync(join(w.dir, 'code'), '1');
-  writeFileSync(join(w.dir, 'err'), 'thread not found');
-  const watcher = w.watch('--quiet', '0', '--progress', '600000', '--retry', '60', '--attempts', '2');
-  r.ok('post', '--as', 'd', '--to', 'a1', '--type', 'NOTE', '--body', 'first');
-  assert.ok(await until(() => r.events().some((e) => e.type === 'WAKE_FAILED')));
-  assert.equal(w.count(), 2);
-  assert.match(r.events().find((e) => e.type === 'WAKE_FAILED').body, /status=1 .*thread not found/);
-  watcher.child.kill();
-  await watcher.closed;
-});
-
-test('post warns when a recipient depends on a watcher and none is running', async () => {
-  const r = makeRun();
-  codexMember(r);
-  const res = r.ok('post', '--as', 'd', '--to', 'a1', '--type', 'NOTE', '--body', 'x');
-  assert.match(res.out, /none is running/);
-  assert.doesNotMatch(r.ok('post', '--as', 'd', '--to', 't1', '--type', 'NOTE', '--body', 'x').out, /none is running/);
-  const w = fakeWake(r);
-  const watcher = w.watch('--quiet', '100000');
-  assert.ok(await until(() => watcher.out().includes('watching')));
-  assert.doesNotMatch(r.ok('post', '--as', 'd', '--to', 'a1', '--type', 'NOTE', '--body', 'y').out, /none is running/);
-  watcher.child.kill();
-  await watcher.closed;
-});
-
-test('watch: contact from a busy member restarts the clock, and silence after it still fails', async () => {
-  const r = makeRun();
-  codexMember(r);
-  r.drain('d');
-  const w = fakeWake(r);
-  const watcher = w.watch('--quiet', '0', '--progress', '400', '--attempts', '2');
-  r.ok('post', '--as', 'd', '--to', 'a1', '--type', 'NOTE', '--body', 'first');
-  assert.ok(await until(() => w.count() === 1));
-  // Busy, not gone: it posts about something else without having read this yet.
-  await pause(150);
-  r.ok('post', '--as', 'a1', '--to', 'd', '--type', 'NOTE', '--body', 'still on the previous thing');
-  await pause(350);
-  assert.equal(w.count(), 1, 'contact pushed the retry back');
-  assert.ok(await until(() => r.events().some((e) => e.type === 'WAKE_FAILED')));
-  assert.equal(w.count(), 2);
-  watcher.child.kill();
-  await watcher.closed;
-});
-
-test('watch: a restarted watcher picks up pending messages, does not repeat a fresh signal, and only one runs', async () => {
-  const r = makeRun();
-  codexMember(r);
-  const w = fakeWake(r);
-  const first = w.watch('--quiet', '0', '--progress', '60000');
-  r.ok('post', '--as', 'd', '--to', 'a1', '--type', 'NOTE', '--body', 'before the restart');
-  assert.ok(await until(() => w.count() === 1));
-
-  const second = w.watch('--quiet', '0');
-  assert.equal(await second.closed, 0);
-  assert.match(second.out(), /already running/);
-
-  first.child.kill('SIGKILL');
-  await first.closed;
-  const after = w.watch('--quiet', '0', '--progress', '60000', '--stale', '200');
-  assert.ok(await until(() => after.out().includes('watching')), 'a dead heartbeat is taken over');
-  await pause(300);
-  assert.equal(w.count(), 1, 'the signal already sent is remembered');
-  after.child.kill('SIGKILL');
-  await after.closed;
-
-  // Messages written while nobody watched are signalled by the next watcher.
-  const batch = batchOf(r.ok('wait', '--as', 'a1', '--timeout', '0').out);
-  r.team('wait', '--as', 'a1', '--timeout', '0', '--seen', batch);
-  r.ok('post', '--as', 'd', '--to', 'a1', '--type', 'NOTE', '--body', 'while nobody watched');
-  const third = w.watch('--quiet', '0', '--progress', '60000', '--stale', '200');
-  assert.ok(await until(() => w.count() === 2));
-  assert.ok(JSON.parse(r.ok('status', '--json').out).members.find((m) => m.id === 'a1').wake);
-  assert.match(r.ok('status').out, /watcher: alive/);
-  third.child.kill();
-  await third.closed;
-});
-
-test('watch ends by itself when the run closes', async () => {
-  const r = makeRun();
-  codexMember(r);
-  const w = fakeWake(r);
-  const watcher = w.watch();
-  await pause(150);
-  r.ok('close', '--as', 'd', '--status', 'abandoned', '--reason', 'done');
-  assert.equal(await watcher.closed, 0);
-  assert.match(watcher.out(), /run closed: abandoned/);
-  assert.ok(!existsSync(join(r.run, '.state', 'watch.json')));
+  const waiter = spawn(process.execPath, [r.script, 'wait', '--as', 'a1', '--timeout', '20', '--poll', '50'], { cwd: r.root, stdio: 'pipe' });
+  const closed = new Promise((done) => waiter.on('close', done));
+  const marker = join(r.run, '.state', 'waiting-a1');
+  for (let n = 0; n < 100 && !existsSync(marker); n++) await new Promise((done) => setTimeout(done, 50));
+  const kept = readFileSync(marker, 'utf8');
+  assert.match(r.ok('status').out, /a1 architect.*wait started/);
+  const heard = r.ok('post', '--as', 'd', '--to', 'a1,t1', '--type', 'NOTE', '--body', 'a1 listens').out;
+  assert.match(heard, /not waiting: t1 /);
+  assert.equal(await closed, 0, 'the wait returned the message');
+  assert.doesNotMatch(r.ok('post', '--as', 't1', '--to', 't1', '--type', 'NOTE', '--body', 'to myself').out, /not waiting/);
+  writeFileSync(marker, kept);
+  assert.match(r.ok('post', '--as', 'd', '--to', 'a1', '--type', 'NOTE', '--body', 'stale marker').out, /not waiting: a1 /);
+  assert.doesNotMatch(r.ok('status').out, /a1 architect.*wait started/);
 });
 
 test('exec says whether the directory holds the revision, including untracked files, and a verdict on another tree is flagged', () => {
@@ -1048,67 +853,6 @@ test('operation IDs belong to a sender and reject changed payloads', () => {
   assert.match(post('a1', 'architect').out, /already posted/);
   assert.equal(post('a1', 'different').code, 5);
   assert.equal(r.events().filter(e => e.op === 'probe').length, 2);
-});
-
-test('bindings are explicit, include the driver, and reject invalid inputs', () => {
-  const r = makeRun();
-  const res = spawnSync(process.execPath, [r.script, 'join', '--role', 'tester', '--runtime', 'opencode'], {
-    cwd: r.root, encoding: 'utf8', env: { ...process.env, CODEX_THREAD_ID: 'unrelated-thread' },
-  });
-  assert.equal(res.status, 0);
-  assert.doesNotMatch(res.stdout, /woken by/);
-  r.ok('bind', '--as', 'd', '--wake', 'codex-queue', '--thread', 'driver-thread');
-  assert.equal(JSON.parse(r.ok('status', '--json').out).members.find(m => m.id === 'd').wake.thread, 'driver-thread');
-  r.ok('bind', '--as', 'd', '--wake', 'none');
-  assert.equal(JSON.parse(r.ok('status', '--json').out).members.find(m => m.id === 'd').wake, null);
-  assert.equal(r.team('bind', '--as', 'd', '--wake', 'opencode').code, 2);
-  assert.equal(r.team('bind', '--as', 'd', '--wake', 'opencode', '--thread', 'ses_x', '--server', 'http://user:secret@localhost').code, 2);
-  assert.equal(r.team('watch', '--attempts', '0').code, 2);
-});
-
-test('OpenCode V2 queues a fixed reminder to the bound session and preserves failed delivery', async () => {
-  const r = makeRun();
-  r.drain('t1');
-  r.ok('bind', '--as', 't1', '--wake', 'opencode', '--thread', 'ses_test', '--server', 'http://127.0.0.1:4096');
-  const file = join(r.root, 'adapter.cjs');
-  const calls = join(r.root, 'calls.jsonl');
-  writeFileSync(file, `#!${process.execPath}\nrequire('node:fs').appendFileSync(${JSON.stringify(calls)}, JSON.stringify(process.argv.slice(2))+'\\n'); process.exit(1);`);
-  execFileSync('chmod', ['+x', file]);
-  const child = spawn(process.execPath, [r.script, 'watch', '--poll', '30', '--quiet', '0', '--retry', '30', '--attempts', '2'], {
-    cwd: r.root, stdio: 'ignore', env: { ...process.env, TEAM_OPENCODE_CMD: file },
-  });
-  const closed = new Promise(done => child.on('close', done));
-  try {
-    r.ok('post', '--as', 'd', '--to', 't1', '--type', 'NOTE', '--body', 'peer secret not for prompt');
-    assert.ok(await until(() => r.events().some(e => e.type === 'WAKE_FAILED')));
-    const rows = readFileSync(calls, 'utf8').trim().split('\n').map(JSON.parse);
-    assert.equal(rows.length, 2);
-    assert.deepEqual(rows[0].slice(0, 4), ['api', 'session.prompt', '--param', 'sessionID=ses_test']);
-    const body = JSON.parse(rows[0][rows[0].indexOf('--data') + 1]);
-    assert.equal(body.delivery, 'queue');
-    assert.equal(body.resume, true);
-    assert.doesNotMatch(body.text, /peer secret/);
-    assert.match(r.ok('wait', '--as', 't1', '--timeout', '0').out, /peer secret/);
-    // Recover the exact same session after a configuration fix.
-    r.ok('bind', '--as', 't1', '--wake', 'opencode', '--thread', 'ses_test', '--server', 'http://127.0.0.1:4096');
-    assert.ok(await until(() => readFileSync(calls, 'utf8').trim().split('\n').length > 2));
-  } finally { child.kill(); await closed; }
-});
-
-test('unacknowledged output is retried; a transport success is not receipt', async () => {
-  const r = makeRun();
-  codexMember(r);
-  const w = fakeWake(r);
-  const watcher = w.watch('--quiet', '0', '--progress', '200', '--attempts', '2');
-  try {
-    r.ok('post', '--as', 'd', '--to', 'a1', '--type', 'NOTE', '--body', 'recover me');
-    assert.ok(await until(() => w.count() === 1));
-    r.ok('wait', '--as', 'a1', '--timeout', '0');
-    assert.ok(await until(() => r.events().some(e => e.type === 'WAKE_FAILED')));
-    assert.equal(w.count(), 2);
-    r.drain('a1');
-    assert.ok(await until(() => JSON.parse(r.ok('status', '--json').out).members.find(m => m.id === 'a1').wake.state === 'idle'));
-  } finally { watcher.child.kill(); await watcher.closed; }
 });
 
 test('the protocol stays under its 15 KB ceiling', { skip: !existsSync(join(SKILL_ROOT, 'references', 'protocol.md')) }, () => {

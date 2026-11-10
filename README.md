@@ -30,11 +30,16 @@ Domyślne dowiązania współdzielą zainstalowaną kopię; `--copy` tworzy osob
 Instalacja z lokalnej ścieżki nie oznacza automatycznej synchronizacji każdej edycji
 checkoutu — po zmianach ponów `add`.
 
-| Platforma | Katalog globalny |
-|---|---|
-| Claude Code | `~/.claude/skills/` |
-| Codex | `~/.agents/skills/` |
-| OpenCode | `~/.config/opencode/skills/` |
+Przy instalacji globalnej dla tych trzech agentów (sprawdzone na `skills@1.7.6`) powstaje
+jedna kopia i jedno dowiązanie:
+
+| Ścieżka | Co to jest | Kto z niej korzysta |
+|---|---|---|
+| `~/.agents/skills/team` | właściwa kopia skilla | Codex, OpenCode |
+| `~/.claude/skills/team` | dowiązanie do kopii powyżej | Claude Code |
+
+Instalator nie zapisuje niczego w `~/.config/opencode/skills/`. Po instalacji sprawdź
+w sesji OpenCode, czy skill `team` jest widoczny — tego nie zweryfikowaliśmy.
 
 Repozytorium prywatne wymaga skonfigurowanego dostępu Git/SSH. Można podać URL SSH:
 
@@ -56,8 +61,8 @@ Ponowny `add` z tym samym źródłem jest również sposobem odświeżenia skill
 Testowaną wersję instalatora można przypiąć jako `npx skills@1.7.6 ...`.
 Po instalacji sprawdź katalog skilli w CLI lub uruchom nową sesję.
 
-Usunięcie skilla nie usuwa historii `.team/` w projektach, nie zamyka działających
-sesji i nie zatrzymuje watcherów. Najpierw zakończ run przez `close`. Run zachowuje
+Usunięcie skilla nie usuwa historii `.team/` w projektach i nie zamyka działających
+sesji. Najpierw zakończ run przez `close`. Run zachowuje
 własną kopię skryptu i instrukcji, więc aktualizacja instalacji nie zmienia trwającej pracy.
 `gc --dry-run` pokazuje stare referencje Git możliwe do usunięcia, a `gc` usuwa je tylko
 dla zamkniętych runów; dzienniki zostają. Nie usuwaj aktywnej `.team/`.
@@ -84,17 +89,18 @@ Katalog `.team/` jest wyłączany lokalnie ze śledzenia w Git.
 
 ### Komunikacja
 
-| Runtime | Automatyczne powiadomienie |
-|---|---|
-| Claude Code | `wait` jako zadanie w tle z powiadomieniem o zakończeniu |
-| Codex | watcher → `codex queue --thread ... --resume`, przy działającej usłudze sesji |
-| OpenCode V2 | watcher → `opencode api session.prompt`, kolejka do konkretnej sesji |
-| Inne CLI / brak działającego adaptera | jawny odbiór i ograniczone oczekiwanie |
+Skill nie budzi bezczynnych sesji. Wiadomości czekają w dzienniku runu, a sesję, która
+ma coś do przeczytania, wznawia użytkownik nadzorujący pracę.
 
-Szczegóły konfiguracji, sprawdzenia komunikacji w obie strony i odzyskiwania sesji:
-[delivery.md](skills/team/references/delivery.md). Instalator nie konfiguruje automatycznie
-usług sesji ani globalnych hooków. Skuteczność budzenia trzeba sprawdzić dla konkretnej
-sesji; sukces polecenia transportowego nie jest potwierdzeniem odbioru.
+| Sesja | Jak odbiera wiadomości |
+|---|---|
+| Claude Code | `wait` jako zadanie w tle; jego zakończenie rozpoczyna kolejną turę |
+| Codex, OpenCode, inne CLI | czyta po wznowieniu przez użytkownika (`wait --timeout 0`); w trakcie tury może krótko poczekać |
+
+Po każdym `post` skrypt wypisuje `not waiting: <id>` dla adresatów bez działającego `wait`.
+Driver przekazuje to użytkownikowi — to lista zakładek do wznowienia. `status` pokazuje,
+kto ma nieprzeczytane wiadomości. Szczegóły: sekcja „Waiting” w
+[protocol.md](skills/team/references/protocol.md).
 
 ### Polecenia pomocnicze
 
@@ -108,8 +114,7 @@ node /path/to/run/team.mjs status
 node /path/to/run/team.mjs gates
 ```
 
-`doctor` sprawdza możliwość zapisu i snapshotów w bieżącym repozytorium. Nie dowodzi,
-że zdalna sesja przyjmuje wiadomości — temu służy próba opisana w instrukcji delivery.
+`doctor` sprawdza możliwość zapisu i snapshotów w bieżącym repozytorium.
 
 ## Rozwój i pochodzenie
 
@@ -118,14 +123,15 @@ npm run check
 npm test
 ```
 
-Testy uruchamiają prawdziwe procesy skryptu w tymczasowych repozytoriach. Adaptery CLI
-są symulowane; testy nie wysyłają promptów do modeli. Wykrywanie skilla sprawdzono przez `skills@1.7.6 add . --list`. Pełnego cyklu
-instalacji globalnej i odinstalowania jeszcze nie wykonano. Do testów adapterów można wskazać wykonywalne
-pliki przez `TEAM_CODEX_CMD` i `TEAM_OPENCODE_CMD` (pojedyncza ścieżka, bez argumentów).
+Testy uruchamiają prawdziwe procesy skryptu w tymczasowych repozytoriach i nie wysyłają
+promptów do modeli. Instalację globalną sprawdzono przez `skills@1.7.6` w odizolowanym
+katalogu domowym; odinstalowania i prawdziwego runu z kilkoma sesjami jeszcze nie wykonano.
 
 Kod pochodzi z `mrstroz/claude-code-plugins`, `team` na gałęzi `feat/team-plugin`, commit
 `55a0e27`. Został przeniesiony do samodzielnego katalogu; stare repozytorium pozostaje
-bez zmian, aby umożliwić porównanie i dotychczasowe instalacje pluginu.
+bez zmian, aby umożliwić porównanie i dotychczasowe instalacje pluginu. Ta wersja nie ma
+watchera, polecenia `bind` ani adapterów `codex queue` / `opencode api`; ich kod jest
+w tamtym commicie.
 
 [Research i decyzja o komunikacji](docs/agent-communication-research.md) opisują źródła,
 alternatywy, ograniczenia i zakres weryfikacji. Nowe skille dodawaj jako samodzielne
