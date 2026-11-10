@@ -1,0 +1,11 @@
+{
+  "name": "mrstroz-skills",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Portable agent skills installed with the skills CLI",
+  "scripts": {
+    "test": "node --test skills/team/scripts/*.test.mjs",
+    "check": "node --check skills/team/scripts/team.mjs"
+  },
+  "engines": { "node": ">=18" }
+}

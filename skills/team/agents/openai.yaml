@@ -1,0 +1,5 @@
+interface:
+  display_name: "Team"
+  short_description: "Coordinate agent sessions with durable messages"
+policy:
+  allow_implicit_invocation: false
