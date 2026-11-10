@@ -89,16 +89,22 @@ Katalog `.team/` jest wyłączany lokalnie ze śledzenia w Git.
 
 ### Komunikacja
 
-Skill nie budzi bezczynnych sesji. Wiadomości czekają w dzienniku runu, a sesję, która
-ma coś do przeczytania, wznawia użytkownik nadzorujący pracę.
+Cykl każdego miejsca to: **`wait` → obsługa wpisów → potwierdzenie odbioru → kolejne
+`wait`**. Zmiany publikuje się przez skrypt; obserwowany jest dziennik `events.jsonl`.
+Sposób czekania zależy od tego, co potrafi host:
 
-| Sesja | Jak odbiera wiadomości |
+| Sesja | Jak czeka |
 |---|---|
-| Claude Code | `wait` jako zadanie w tle; jego zakończenie rozpoczyna kolejną turę |
-| Codex, OpenCode, inne CLI | czyta po wznowieniu przez użytkownika (`wait --timeout 0`); w trakcie tury może krótko poczekać |
+| Claude Code (host zgłasza modelowi zakończenie zadania w tle) | `wait --timeout 3600` jako zadanie w tle, tura się kończy; bez kroków modelu podczas czekania |
+| Codex, OpenCode, inne CLI | blokujące `wait` w aktywnej turze (domyślnie 600 s, skracane do limitu narzędzia), ponawiane po każdej partii |
+
+Blokujące czekanie ma limit: po 30 minutach bez żadnej wiadomości skrypt wypisuje
+`idle limit reached`, a sesja mówi, na co czeka, i kończy turę. Limit zmienia
+`--idle-limit <sekundy>`; czekania w tle nie dotyczy.
 
 Po każdym `post` skrypt wypisuje `not waiting: <id>` dla adresatów bez działającego `wait`.
-Driver przekazuje to użytkownikowi — to lista zakładek do wznowienia. `status` pokazuje,
+Adresat może akurat pracować. Ręczne wznowienie jest potrzebne po zakończeniu tury lub
+wyczerpaniu limitu hosta, jeśli host nie dostarcza powiadomień o zakończeniu zadania w tle. `status` pokazuje,
 kto ma nieprzeczytane wiadomości. Szczegóły: sekcja „Waiting” w
 [protocol.md](skills/team/references/protocol.md).
 

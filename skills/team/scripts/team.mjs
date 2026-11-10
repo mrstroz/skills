@@ -73,7 +73,8 @@ In a run (call the copy in .team/<run>/team.mjs, or pass --run <dir>):
        [--to a1,t1|all] [--item <name>] [--rev <n>] [--seen <batch>] [--op <id>] [--tag authorised|declined]
        [--held executed|inspected|not-run] [--evidence <exec ids>]     required on OK and FIX
   exec --as <id> [--item <name> --rev <n>] [--in <dir>] [--timeout <s>] -- <command>   run a check and record it
-  wait --as <id> [--timeout <seconds>] [--seen <batch>] [--poll <ms>] [--soft-timeout]
+  wait --as <id> [--timeout <seconds>] [--seen <batch>] [--poll <ms>] [--soft-timeout] [--idle-limit <seconds>]
+                                                                       blocks up to 600s (10 minutes) by default; fit timeout to host
                                                                        exit 0 messages, 3 timeout, 4 closed
   log [--since <n>] [--tag <t>]                                        read history; confirms nothing
   gates [--json]                                                       what is approved and what is missing
@@ -425,6 +426,7 @@ function memberFiles(run, member) {
     contact: join(state, `contact-${member}`),
     waiting: join(state, `waiting-${member}`),
     doing: join(state, `doing-${member}`),
+    idle: join(state, `idle-${member}`),
   };
 }
 
@@ -727,7 +729,7 @@ function cmdStart({ positional, flags }) {
     console.log(`${role}:\n  You are ${/^a/.test(role) ? 'an' : 'a'} ${role} in this team. Read ${join(run, 'roles', `${role}.md`)} and follow it.`);
     console.log(`  Join with: ${shellCommand(['node', script])} join --role ${role} --runtime <your CLI>\n`);
   }
-  console.log('Nothing wakes an idle session. Claude Code can keep `wait` running as a background task; any other session reads its messages when the user resumes it.');
+  console.log('Waiting is described in PROTOCOL.md: a background wait where the host reports finished background commands to the model, otherwise blocking waits inside the turn, up to the idle limit. An ended turn with no background wait needs the user to resume it.');
 }
 
 function cmdRuns({ flags }) {
@@ -1076,12 +1078,13 @@ function cmdPost({ flags }) {
   });
 
   touchContact(run, result.member.id);
+  rmSync(memberFiles(run, result.member.id).idle, { force: true });
   const { event } = result;
   console.log(`${result.repeated ? 'already posted' : 'posted'} #${event.seq} ${event.id}${event.meta?.late ? ' (late: this revision is no longer the one needed, it opens nothing)' : ''}${event.meta?.not_required ? ' (not required of you, it opens nothing)' : ''}`);
   // Nothing wakes an idle session, so the sender has to learn who will not see this
   // until somebody resumes them. A member with a `wait` running gets it by itself.
   const absent = (event.to ?? []).filter((id) => id !== result.member.id && !waitingSince(run, id));
-  if (absent.length && !result.repeated) console.log(`not waiting: ${absent.join(', ')} — ask the user to resume ${absent.length > 1 ? 'those sessions' : 'that session'}`);
+  if (absent.length && !result.repeated) console.log(`not waiting: ${absent.join(', ')} — may be working; resume manually if the session has ended its turn`);
   if (event.meta?.contradiction) console.log(`warning: this verdict cites a run with ${event.meta.contradiction}; it is recorded as a contradiction`);
   console.log(unreadLine(run, readEvents(run), result.member.id));
 }
@@ -1090,15 +1093,19 @@ function cmdWait({ flags }) {
   const run = resolveRun(flags);
   const initial = reduce(readEvents(run));
   const member = requireMember(initial, flags);
-  const timeoutMs = (flags.timeout === undefined ? 540 : Number(flags.timeout)) * 1000;
+  const timeoutSeconds = flags.timeout === undefined ? 600 : Number(flags.timeout);
+  const timeoutMs = timeoutSeconds * 1000;
   const pollMs = flags.poll === undefined ? 500 : Number(flags.poll);
+  const idleLimitMs = (flags['idle-limit'] === undefined ? 1800 : Number(flags['idle-limit'])) * 1000;
   if (!Number.isFinite(timeoutMs) || timeoutMs < 0 || !Number.isFinite(pollMs) || pollMs < 1) fail('bad --timeout or --poll', EXIT.usage);
+  if (!Number.isFinite(idleLimitMs) || idleLimitMs < 0) fail('bad --idle-limit', EXIT.usage);
   const files = memberFiles(run, member.id);
   if (typeof flags.seen === 'string') withLock(run, () => acknowledge(run, member.id, flags.seen));
 
   const since = new Date().toISOString();
   const { log } = paths(run);
-  const deadline = Date.now() + timeoutMs;
+  const startedAt = Date.now();
+  const deadline = startedAt + timeoutMs;
   let lastSize = -1;
   writeFileSync(files.waiting, JSON.stringify({ since, pid: process.pid }));
   try {
@@ -1118,13 +1125,26 @@ function cmdWait({ flags }) {
           for (const e of pending) console.log(entry(e));
           console.log(`batch: batch-${last}`);
           console.log(`next: acknowledge it by adding --seen batch-${last} to your next post or wait`);
+          rmSync(files.idle, { force: true });
           if (closed) { console.log(`run closed: ${closed.meta.status}`); return EXIT.closed; }
+          console.log('after processing: wait again the way PROTOCOL.md describes for your host: register a background wait and end the turn, or block again inside this turn');
           return EXIT.ok;
         }
         if (closed) { console.log(`run closed: ${closed.meta.status}`); return EXIT.closed; }
       }
       if (Date.now() >= deadline) {
-        console.log(`state: idle, no messages; run again: wait --as ${member.id}`);
+        // Time spent inside waits with nothing arriving, summed over consecutive waits. A
+        // session blocking inside its turn pays a model step per idle wait, and with no
+        // bound it would keep paying for as long as the others stay silent.
+        const idleMs = readNumber(files.idle) + (Date.now() - startedAt);
+        atomicWrite(files.idle, String(idleMs));
+        const again = `wait --as ${member.id} --timeout ${timeoutSeconds}${flags['soft-timeout'] ? ' --soft-timeout' : ''}`;
+        console.log(`state: idle, no messages for ${Math.round(idleMs / 60000)} min of waiting in a row`);
+        if (idleMs >= idleLimitMs) {
+          console.log(`idle limit reached (${Math.round(idleLimitMs / 60000)} min). If you block inside the turn: stop, tell the user which run and seat you wait on, and end the turn; they resume you. A background wait costs no model steps and may be registered again: ${again}`);
+        } else {
+          console.log(`next: ${again}`);
+        }
         // Timing out is the normal case. A tool that shows any non-zero exit as a failure
         // can ask for 0 and read this line instead.
         return flags['soft-timeout'] ? EXIT.ok : EXIT.timeout;

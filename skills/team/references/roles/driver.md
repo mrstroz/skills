@@ -9,7 +9,7 @@ Read `PROTOCOL.md` in the run directory first. It is the contract and everything
 `start` creates the run and prints a line to paste into each other session. Give those lines to the user, then wait for the `JOIN`s. `team.md` shows who joined, from which CLI and what each can write.
 
 - `snap=no` next to a member means you take its snapshots with `snap --as d --item <name> --for <id>`.
-- After a `post`, a line `not waiting: <ids>` names the members who will not see it until somebody resumes them. Tell the user which sessions to resume; nothing else will.
+- After a `post`, a line `not waiting: <ids>` names the members who will not see it until somebody resumes them. They may be working. Keep waiting as PROTOCOL.md describes for your host; ask the user to resume a session only when it has ended its turn, which it says when it reaches the idle limit.
 
 Put what the user allowed on record before any work: `post --type DECISION --to all --tag authorised` with goals and permissions in the user's words (push, deploy, data changes, touching their own uncommitted files). Which files an implementation touches is the team's to work out and does not go here.
 

@@ -6,7 +6,8 @@ benchmarkiem jakości modeli ani dowodem działania każdej konfiguracji.
 
 **Decyzja (2026-11-10): pierwsza wersja nie budzi sesji.** Wspólna skrzynka zostaje,
 a watcher, polecenie `bind` i adaptery `codex queue` / `opencode api` zostały usunięte.
-Sesję, która ma coś do przeczytania, wznawia użytkownik nadzorujący run. Powód: budzenia
+W aktywnej turze agent wykonuje cykl blokujące `wait` → obsługa → potwierdzenie →
+kolejne `wait`, w granicach hosta. Po zakończeniu tury może być potrzebne wznowienie przez użytkownika. Powód: budzenia
 nie udało się sprawdzić na prawdziwych sesjach, zależało od usług sesji konkretnego
 dostawcy i wymagało ręcznego podawania identyfikatorów sesji. Usunięty kod jest
 w `mrstroz/claude-code-plugins`, gałąź `feat/team-plugin`, commit `55a0e27`.
@@ -43,7 +44,7 @@ na wypadek powrotu do adaptera; obecna wersja z niego nie korzysta.
 3. **Supervisor uruchamiający wszystkie modele przez SDK / ACP.** Kontroluje cykl życia,
    timeouty i dostarczanie wejść. To sensowny kierunek dla autonomicznego launchera,
    lecz zmienia sposób uruchamiania CLI i zakres projektu.
-4. **Wspólna lokalna skrzynka, wznawianie przez użytkownika.** Zachowuje istniejące
+4. **Wspólna lokalna skrzynka, blokujące oczekiwanie w aktywnej turze.** Zachowuje istniejące
    interaktywne sesje i nie zależy od żadnego dostawcy. Ten wariant wybieramy. Adaptery
    budzenia (własne albo hooki w stylu hcom) można dołożyć później bez zmiany protokołu,
    bo treść wiadomości zawsze zostaje w dzienniku.
@@ -62,7 +63,11 @@ różnych komputerach, trzeba ponownie ocenić supervisor lub serwer skrzynki.
   `--seen` potwierdza odczytaną partię; identyfikatory zdarzeń i `--op` pozwalają obsłużyć
   powtórzenia. Nie deklarujemy exactly-once dla działań zewnętrznych agenta.
 - Nic nie budzi bezczynnej sesji. Claude Code trzyma `wait` jako zadanie w tle, którego
-  zakończenie rozpoczyna turę; pozostałe sesje czytają po wznowieniu przez użytkownika.
+  zakończenie rozpoczyna turę; pozostałe sesje blokują się na `wait` w aktywnej turze
+  i ponawiają oczekiwanie w granicach czasu hosta. Ręczne wznowienie jest fallbackiem.
+- Blokujące czekanie ma limit bezczynności (domyślnie 30 minut łącznie, `--idle-limit`),
+  bo każdy bezczynny `wait` to krok modelu. Po limicie sesja kończy turę i czeka na
+  wznowienie. Czekanie w tle nie kosztuje kroków modelu i limit go nie dotyczy.
 - `post` wypisuje `not waiting: <id>` dla adresatów bez żywego procesu `wait`. Znacznik
   po zabitym `wait` nie liczy się, bo sprawdzany jest proces, który go zapisał.
 - Wiadomość od innego agenta jest danymi zadania, nie poleceniem użytkownika ani nowym

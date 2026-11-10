@@ -590,6 +590,49 @@ test('wait holds no lock: a post goes through while somebody waits', async () =>
   assert.ok(Date.now() - started < 5000);
 });
 
+test('blocking wait can be rearmed with acknowledgement for the next batch', async () => {
+  const r = makeRun();
+  r.drain('a1');
+  let seen;
+  for (const body of ['first batch', 'second batch']) {
+    const args = [r.script, 'wait', '--as', 'a1', '--timeout', '5', '--poll', '20', '--soft-timeout'];
+    if (seen) args.push('--seen', seen);
+    const child = spawn(process.execPath, args, { cwd: r.root, stdio: 'pipe' });
+    let output = '';
+    child.stdout.on('data', data => { output += data; });
+    const closed = new Promise(done => child.on('close', done));
+    try {
+      const marker = join(r.run, '.state', 'waiting-a1');
+      for (let n = 0; n < 100 && !existsSync(marker); n++) await new Promise(done => setTimeout(done, 20));
+      assert.ok(existsSync(marker), 'wait is registered before publishing');
+      r.ok('post', '--as', 'd', '--to', 'a1', '--type', 'NOTE', '--body', body);
+      assert.equal(await closed, 0);
+      assert.ok(output.includes(body));
+      if (seen) assert.ok(!output.includes('first batch'), 'acknowledged work does not reappear');
+      seen = batchOf(output);
+      assert.ok(seen);
+    } finally { child.kill(); await closed; }
+  }
+  assert.equal(r.team('wait', '--as', 'a1', '--seen', seen, '--timeout', '0').code, 3);
+});
+
+test('idle time adds up across waits, reaches the limit, and a batch or a post resets it', () => {
+  const r = makeRun();
+  r.drain('a1');
+  const idle = (...extra) => r.ok('wait', '--as', 'a1', '--timeout', '1', '--poll', '50', '--soft-timeout', ...extra).out;
+  const first = idle('--idle-limit', '2');
+  assert.match(first, /state: idle/);
+  assert.match(first, /next: wait --as a1 --timeout 1 --soft-timeout/);
+  assert.doesNotMatch(first, /idle limit reached/);
+  assert.match(idle('--idle-limit', '2'), /idle limit reached/);
+  r.ok('post', '--as', 'a1', '--to', 'd', '--type', 'NOTE', '--body', 'still here');
+  assert.doesNotMatch(idle('--idle-limit', '2'), /idle limit reached/, 'a post resets it');
+  r.ok('post', '--as', 'd', '--to', 'a1', '--type', 'NOTE', '--body', 'news');
+  r.drain('a1');
+  assert.doesNotMatch(idle('--idle-limit', '2'), /idle limit reached/, 'a batch resets it');
+  assert.equal(r.team('wait', '--as', 'a1', '--timeout', '0', '--idle-limit', 'x').code, 2);
+});
+
 test('wait wakes only its addressee', async () => {
   const r = makeRun();
   r.drain('t1');

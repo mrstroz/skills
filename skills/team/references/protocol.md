@@ -14,40 +14,58 @@ Your role file holds the detail. Everyone needs the rest of this page.
 
 ## Waiting
 
-Nothing wakes an idle session. Messages stay in the log until you read them, and the
-user, who supervises the run, resumes a session that has something to read. Which of the
-two ways below you use depends on what your session can do, not on its name.
+The cycle is the same for every role: **wait → process entries → acknowledge → wait
+again**. The script observes `events.jsonl`; publish changes through the script rather
+than editing the generated chat or plan views. Each wait returns one batch, not a
+permanent subscription. How you wait depends on what your host can do, not on its name.
 
-**Your CLI notifies the model when a background command finishes** (Claude Code does):
-run this as a background task, and end the turn once the task is registered.
+**The host reports finished background commands to the model** (Claude Code does). Use
+this whenever it is available: it costs no model steps while nothing happens, and the
+user can still talk to the session.
 
 ```sh
 node "<run>/team.mjs" wait --as <you> --timeout 3600 --soft-timeout
 ```
 
-Its completion starts your next turn. Work on the batch, acknowledge it, and register the
-next wait. On `state: idle`, register it again. A command detached with `nohup` or `&`
-notifies nobody, so it does not count.
+Run it through the host's background task mechanism and end the turn once the task is
+registered. Its completion starts your next turn: process the batch, acknowledge it,
+register the next wait, end the turn. On `state: idle`, register it again. A command
+detached with `nohup` or `&` alone notifies nobody, so it does not count.
 
-**Anything else** (Codex, OpenCode, a CLI you are unsure of): read once whenever your
-turn starts, and before publishing a verdict.
+**Any other host** (Codex, OpenCode, a CLI you are unsure of): block inside the turn.
 
 ```sh
-node "<run>/team.mjs" wait --as <you> --timeout 0
+node "<run>/team.mjs" wait --as <you> --timeout 600 --soft-timeout
 ```
 
-While a turn is active and you expect an answer soon, one bounded wait is fine, within
-your tool's time limit. When there is nothing to read and nothing left to do, say that
-you are waiting for the others and end the turn; the user resumes you. Do not spend
-model turns polling, and do not promise to come back by yourself.
+Choose a timeout that fits the host's command limit and the remaining turn budget,
+leaving a margin for returning the result. The script defaults to 600 seconds, which
+no host guarantees. The file checks happen inside Node, not through model calls. If the
+tool returns a running process or session ID, wait for that same command using the
+host's continuation tool; do not start overlapping waits for the same seat. After a
+batch, do the work, check for other assigned work, and block again.
 
-`post` tells the sender who is `not waiting`. That line is for the user: pass it on, so
-they know which session to resume.
+Blocking has a bound, because every idle wait costs a model step and a silent team
+would otherwise cost them for hours. The script adds up the time you spent in waits
+with nothing arriving and prints it; a batch or a `post` of yours resets it. After 30
+minutes in a row it prints `idle limit reached`: stop, tell the user which run and seat
+you wait on and how to resume (read the role and protocol, then
+`wait --as <you> --timeout 0`), and end the turn. `--idle-limit <seconds>` changes the
+bound when the user asks for another one. A background wait is not bound by it.
+
+Use `--timeout 0` only for a quick check at turn start or before publishing a verdict,
+and never turn zero-timeout checks into a busy loop. Stop waiting when the run closes
+or the user stops the work. Do not claim that a detached listener can restart an ended
+turn: without a registered background wait, only the user brings you back.
+
+`post` reports `not waiting` for recipients without a live wait. They may currently be
+working; this is not proof that they need manual resume. If a session has ended its
+turn, tell the user which session to resume.
 
 | Exit | Meaning | What to do |
 |---|---|---|
-| 0 | messages are printed with a batch id, or `state: idle` under `--soft-timeout` | work on them, and put `--seen <batch>` on your next `post` or `wait` |
-| 3 | nothing arrived in time | carry on, or end the turn as above; do not busy-poll |
+| 0 | a batch, or `state: idle` under `--soft-timeout` | process and acknowledge a batch; on idle, wait again, unless blocking reached the idle limit |
+| 3 | wait timed out without `--soft-timeout` | the same as idle above |
 | 4 | the run is closed | stop; you are free |
 
 Only `--seen` moves your cursor. A batch you did not acknowledge comes back with the same ids, which is how an interrupted or compacted session recovers: skip what you already answered. Every `post` tells you how many messages are unread.
